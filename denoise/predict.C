@@ -8,7 +8,7 @@
 #include "TStopwatch.h"
 
 int predict(){
-
+    ROOT::EnableImplicitMT(0);
     TMVA::Reader* reader = new TMVA::Reader("!Silent");
     TFile* f = new TFile("../mcbm_sim.root");
     TTree* t = (TTree*)f->Get("train");
@@ -24,8 +24,8 @@ int predict(){
     }
     TStopwatch timer;
     timer.Start();
-    TMVA::IMethod* method = reader->BookMVA("DL", "dataset/weights/mCBM_tmvaDL.weights.xml");// takes 0.2s
-    timer.Stop();
+    TMVA::IMethod* method = reader->BookMVA("DL", "./dataset/weights/mCBM_tmvaDL.weights.xml");// takes 0.2s
+    timer.Stop(); //dataset/weights/mCBM_tmvaDL.weights.xml
     Double_t dt1 = timer.RealTime();
     std::cout << "Booking Method took " << dt1 << "s" << std::endl; 
 
@@ -40,14 +40,14 @@ int predict(){
 
     int nofEvents{};
 
-    for(int i{20000}; i < t->GetEntriesFast(); i++){
+    for(int i{20000}; i < 20000+10; i++){ //t->GetEntriesFast()
         nofEvents++;
         t->GetEntry(i);
         timer.Start();
         out = reader->EvaluateRegression("DL"); // takes 0.15s :(
         timer.Stop();
         Double_t dt2 = timer.RealTime();
-        std::cout << "Event: " << nofEvents << "  Time to eval Regress: " << dt2 << "s"<< std::endl;
+        std::cout << "Event: " << i << "  Time to eval Regress: " << dt2 << "s"<< std::endl;
         int allHits{};
         Float_t allHitsSumDiff{};
         int trueHits{};
@@ -69,6 +69,12 @@ int predict(){
             if( in[j] > 0.9 ){ // diff tar&pred for true hit + noise hit
                 allHits++;
                 allHitsSumDiff += TMath::Abs(tar[j] - out[j]);
+            }
+        }
+        std::cout << "in tar pred" << std::endl;
+        for(int j{}; j < 2304; j++){
+            if(in[j] > 0.9){
+                std::cout << in[j] << "  " << tar[j] << "  " << out[j] << std::endl;
             }
         }
 

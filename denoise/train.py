@@ -18,19 +18,19 @@ data = ROOT.TFile.Open("../mcbm_sim.root")
 dataloader.AddRegressionTree(data.Get("train"), 1.0)
 
 for i in range(72 * 32 * 1):
-    dataloader.AddVariable("in[{}]".format(i), "in_{}".format(i), "", "F", 0.0, 1.0)
+    dataloader.AddVariable("in[{}]".format(i), "in_{}".format(i), "", "F")
 
 for i in range(72 * 32 * 1):
-    dataloader.AddTarget("tar[{}]".format(i), "tar_{}".format(i), "", 0.0, 1.0)
+    dataloader.AddTarget("tar[{}]".format(i), "tar_{}".format(i), "")
 
 dataloader.PrepareTrainingAndTestTree(
-    ROOT.TCut(""), "SplitMode=Random:NormMode=None:V:!Correlations:!CalcCorrelations:nTrain_regression=20000")
-
+    ROOT.TCut(""), "SplitMode=Block:NormMode=None:V:!Correlations:!CalcCorrelations:nTrain_regression=24000")
+    #:TrainTestSplit_Regression=1.
 # Define model
-batchLayoutString = "BatchLayout=100|1|2304:"
+batchLayoutString = "BatchLayout=50|1|2304:"
 inputLayoutString = "InputLayout=1|72|32:"
-layoutString = "Layout=CONV|32|3|3|1|1|1|1|RELU,CONV|64|3|3|1|1|1|1|RELU,CONV|64|3|3|1|1|1|1|RELU,CONV|32|3|3|1|1|1|1|RELU,CONV|1|3|3|1|1|1|1|TANH,RESHAPE|FLAT:" #,CONV|32|3|3|1|1|1|1|RELU,CONV|64|3|3|1|1|1|1|RELU
-trainingString = "TrainingStrategy=MaxEpochs=200,BatchSize=100,Optimizer=ADAM,LearningRate=1e-3:"
+layoutString = "Layout=CONV|16|5|5|1|1|2|2|RELU,CONV|32|5|5|1|1|2|2|RELU,CONV|32|5|5|1|1|2|2|RELU,CONV|16|5|5|1|1|2|2|RELU,CONV|1|3|3|1|1|1|1|TANH,RESHAPE|FLAT:" #,CONV|128|3|3|1|1|1|1|RELU,CONV|128|3|3|1|1|1|1|RELU
+trainingString = "TrainingStrategy=MaxEpochs=200,BatchSize=50,ConvergenceSteps=5,Repetitions=1,TestRepetitions=1,Optimizer=ADAM,LearningRate=1e-3:"
 cnnOptions = "H:V:VarTransform=None:ErrorStrategy=SUMOFSQUARES:VerbosityLevel=Debug:Architecture=GPU"
 options = batchLayoutString + inputLayoutString + layoutString + trainingString + cnnOptions
 

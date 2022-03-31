@@ -1,11 +1,17 @@
 #include <string>
 #include <iostream>
 #include <vector>
+
+
 #include "TMVA/Reader.h"
 #include "TFile.h"
 #include "TTree.h"
 #include "TMVA/MethodDL.h"
 #include "TStopwatch.h"
+#ifdef R__HAS_CUDNN
+#include "TMVA/DNN/Architectures/TCudnn.h"
+#endif
+
 
 
 using namespace TMVA::DNN::CNN;
@@ -17,7 +23,7 @@ using TMVA::DNN::EInitialization;
 using TMVA::DNN::EOutputFunction;
 using TMVA::DNN::EOptimizer;
 
-using Architecture_t = TMVA::DNN::TCpu<Float_t>;
+using Architecture_t = TMVA::DNN::TCuda<Float_t>;
 using Scalar_t = typename Architecture_t::Scalar_t;
 using Matrix_t = typename Architecture_t::Matrix_t;
 using Tensor_t = typename Architecture_t::Tensor_t;
@@ -26,76 +32,138 @@ using DeepNet_t = TMVA::DNN::TDeepNet<Architecture_t, Layer_t>;
 using TMVAInput_t =  std::tuple<const std::vector<TMVA::Event *> &, const TMVA::DataSetInfo &>;
 using TensorDataLoader_t = TTensorDataLoader<TMVAInput_t, Architecture_t>;
 
-DeepNet_t* ReadModelFromXML(TString);
+DeepNet_t* ReadModelFromXML(TString, size_t);
+std::vector<TMVA::Event *> loadEvents();
 
-int predict_comp(){
-    TStopwatch timer;
-   
-    // predict with reader class ---------------------------
-    TMVA::Reader* reader = new TMVA::Reader("!Silent");
-    TFile* f = new TFile("../mcbm_sim.root");
-    TTree* t = (TTree*)f->Get("train");
-    Float_t in[2304];
-    Float_t tar[2304];
-    t->SetBranchAddress("in", in);
-    t->SetBranchAddress("tar", tar);
-    t->GetEntry(21000); //do single pred on some test event
+int predict_batch(size_t batchSize = 50){
     
-    for(int i{}; i < 2304; i++){
-        std::string varName = "in[" + std::to_string(i) + "]"; 
-        reader->AddVariable(varName, &in[i]);
+    TMVA::Tools::Instance();
+    Architecture_t::SetRandomSeed(10);
+    TStopwatch timer;
+    const std::vector<TMVA::Event *> allData = loadEvents();
+      
+    TString fileXML = "dataset/weights/mCBM_tmvaDL.weights.xml";
+    DeepNet_t* fNet = ReadModelFromXML(fileXML, batchSize);
+
+
+    // Loading the training and validation datasets
+    TMVA::DataSetInfo dsix;
+    for(int i{0}; i < 72*32; i++){
+        TString in1; in1.Form("in[%d]", i);
+        TString in2; in2.Form("in_%d", i);
+        dsix.AddVariable(in1, in2, "");
+
+        TString out1; out1.Form("tar[%d]", i);
+        TString out2; out2.Form("tar_%d", i);
+        dsix.AddTarget(out1, out2, "", (0.0), (0.0));
     }
-    TMVA::IMethod* method = reader->BookMVA("DL", "dataset/weights/mCBM_tmvaDL.weights.xml");
-    std::vector<Float_t> out;
+    TMVAInput_t trainingTuple = std::tie(allData, dsix); 
+    TensorDataLoader_t trainingData(trainingTuple, 1000, fNet->GetBatchSize(),
+                                    {fNet->GetInputDepth(), fNet->GetInputHeight(), fNet->GetInputWidth()},
+                                    {fNet->GetBatchDepth(), fNet->GetBatchHeight(), fNet->GetBatchWidth()} ,
+                                    fNet->GetOutputWidth(), 1);
     timer.Start();
-    out = reader->EvaluateRegression("DL");
+    bool oneOut{};
+    for (auto batch : trainingData) {
+            auto inputTensor = batch.GetInput();
+            TMatrixT<Float_t> inMat(inputTensor.GetMatrix());
+            // (1) 2304 50
+            auto targetMatrix = batch.GetOutput();
+            TMatrixT<Float_t> tarMat(targetMatrix);
+            // 50 2304
+            fNet->Forward(inputTensor);
+            auto pred = fNet->GetLayers().back()->GetOutputAt(0);
+            TMatrixT<Float_t> predMat(pred);
+            // 50 2304
+            if(!oneOut){
+                std::cout << "inMat shape: " << inMat.GetNrows() << " " << inMat.GetNcols() << std::endl;
+                std::cout << "tarMat shape: " << tarMat.GetNrows() << " " << tarMat.GetNcols() << std::endl;
+                std::cout << "predMat shape: " << predMat.GetNrows() << " " << predMat.GetNcols() << std::endl;
+                
+                std::cout << "--------------  first batch  ----------------" << std::endl;
+                for(size_t i{}; i < 2304; i++){
+                    std::cout << "in: " << inMat(i, 0) << "  tar: " << tarMat(0, i) << 
+                                 "  pred: " << predMat(0, i) << std::endl;
+                }
+                std::cout << std::endl;
+
+                std::cout << "--------------  second batch  ----------------" << std::endl;
+                for(size_t i{}; i < 2304; i++){
+                    std::cout << "in: " << inMat(i, 1) << "  tar: " << tarMat(1, i) << 
+                                 "  pred: " << predMat(1, i) << std::endl;
+                }
+                std::cout << std::endl;
+            }
+            oneOut = true;
+        }   
+    
     timer.Stop();
     Double_t dt1 = timer.RealTime();
-    // predict with lowlevel functions ---------------------
-    TString fileXML = "dataset/weights/mCBM_tmvaDL.weights.xml";
-    DeepNet_t* fNet = ReadModelFromXML(fileXML);
-    
-    /* for(int i{}; i < matrix.GetNrows(); i++){
-        for(int j{}; j < matrix.GetNcols(); j++){
-            std::cout << matrix(i,j) << " " ;
-        }
-        std::cout << std::endl;
-    } */
+    std::cout << "timer lowlevel batch " << batchSize << "  total time: " << dt1<< std::endl;
     
     
-    Matrix_t* pred = new TCpuMatrix<Float_t>(1, 72*32);
-    //Tensor_t* input = new TCpuTensor<Float_t>(1, 1, 72, 32);
-    Tensor_t input = Architecture_t::CreateTensor(fNet->GetBatchSize(), fNet->GetInputDepth(), fNet->GetInputHeight(), fNet->GetInputWidth() ); //TODO: store on heap
-    TCpuBuffer<Float_t>* inputBuffer = 
-                    new TCpuBuffer<Float_t>( input.GetSize());
+    
+    
+    
+    
+    
+    //TCudaMatrix<Float_t>* pred = new TCudaMatrix<Float_t>(batchSize, 72*32);
+    /* TCudaMatrix<Float_t>* pred = new TCudaMatrix<Float_t>(batchSize, 2304);
+    Tensor_t input = Architecture_t::CreateTensor(batchSize, fNet->GetInputDepth(), fNet->GetInputHeight(), fNet->GetInputWidth() ); //TODO: store on heap
+    TCudaHostBuffer<Float_t>* inputBuffer = 
+                    new TCudaHostBuffer<Float_t>( input.GetSize());
     input.Zero();
     pred->Zero();
-    //Float_t* data = *(input->GetContainer());
-    for(int i{}; i < 2304; i++){
-        (*inputBuffer)[i] = in[i];
+    for(int i{}; i < batchSize; i++){//t->GetEntriesFast() - 19200
+        t->GetEntry(19200 + i); //do single pred on some test event
+        for(int j{}; j < 2304; j++){
+            (*inputBuffer)[i*2304 +j] = in[j];
+        }
     }
-    timer.Start();
+    
     input.GetDeviceBuffer().CopyFrom(*inputBuffer);
     fNet->Prediction(*pred, input, TMVA::DNN::EOutputFunction::kIdentity);
-    timer.Stop();
-    Double_t dt2 = timer.RealTime();
-    /* std::cout << "index " << "reader " << "lowlevel " << std::endl;
-    for(int i{}; i < 2304; i++){
-        if(out[i] > 0.1 || (*pred)(0,i) > 0.1 ){
-        std::cout << i << " " << out[i] << " " << (*pred)(0,i) << std::endl;
-        }
-    } */
-
-    std::cout << "timer reader: " << dt1 << "    timer lowlevel: " << dt2 << std::endl;
-
-
-
+     */
+    
     return 1;
-
 }
 
+std::vector<TMVA::Event *> loadEvents(){ //target is denoisy input
 
-DeepNet_t* ReadModelFromXML(TString xmlFile){
+    TStopwatch timer;
+    timer.Start();
+    std::cout << "loading Events from file ... \n" ; 
+    TFile *file = TFile::Open("../mcbm_sim.root"); 
+    TTree *tree = (TTree*)file->Get("train"); 
+    Float_t in[2304];
+    Float_t tar[2304];
+    tree->SetBranchAddress("in", in);
+    tree->SetBranchAddress("tar", tar);
+    std::vector<TMVA::Event*> allData;
+        
+    Long64_t nofEntries = tree->GetEntries();
+    for(Long64_t i=0; i < 1000; i++){
+        tree->GetEntry(i);
+        std::vector<Float_t> input; 
+        std::vector<Float_t> target; 
+        
+        for(int j=0; j < 2304; j++){
+            target.push_back(tar[j]);
+            input.push_back(in[j]);
+        }
+        
+
+        TMVA::Event* ev = new TMVA::Event(input, target);
+        allData.push_back(ev); 
+    }
+    timer.Stop();
+    Double_t dt = timer.RealTime();
+    std::cout << "loading finished ! \n" ; 
+    std::cout << "time for loading Events  " << dt << "s\n";  
+    return allData;
+}
+
+DeepNet_t* ReadModelFromXML(TString xmlFile, size_t inBatchSize){
 
     void* model = TMVA::gTools().xmlengine().ParseFile(xmlFile);
     void* rootnode = TMVA::gTools().xmlengine().DocGetRootElement(model);
@@ -133,7 +201,7 @@ DeepNet_t* ReadModelFromXML(TString xmlFile){
     TMVA::gTools().ReadAttr(netXML, "WeightDecay", weightDecay);
 
     // ---- create deepnet ----
-    DeepNet_t* fNetx = new DeepNet_t(1, inputDepth, inputHeight, inputWidth, batchDepth, batchHeight, batchWidth, 
+    DeepNet_t* fNetx = new DeepNet_t(inBatchSize, inputDepth, inputHeight, inputWidth, batchDepth, batchHeight, batchWidth, 
                             static_cast<ELossFunction>(lossFunctionChar),
                             static_cast<EInitialization>(initializationChar),
                             static_cast<ERegularization>(regularizationChar),
