@@ -8,8 +8,10 @@
 #include "TTree.h"
 #include "TMVA/MethodDL.h"
 #include "TStopwatch.h"
-#ifdef R__HAS_CUDNN
-#include "TMVA/DNN/Architectures/TCudnn.h"
+#include "TMVA/ROCCurve.h"
+#include "TGraph.h"
+#ifdef R__HAS_CUDA
+#include "TMVA/DNN/Architectures/Cuda.h"
 #endif
 
 
@@ -33,20 +35,23 @@ using TMVAInput_t =  std::tuple<const std::vector<TMVA::Event *> &, const TMVA::
 using TensorDataLoader_t = TTensorDataLoader<TMVAInput_t, Architecture_t>;
 
 DeepNet_t* ReadModelFromXML(TString, size_t);
-std::vector<TMVA::Event *> loadEvents();
+std::vector<TMVA::Event *> loadEvents(Long64_t, Long64_t,  const char*);
 
-int predict_batch(size_t batchSize = 50){
+int predict_batch(  Float_t NNthreshold = 0.8,
+                    Long64_t nEvents = 1000, 
+                    const char* inFile = "../mcbm_sim.root", 
+                    size_t batchSize = 50)
+{
     
     TMVA::Tools::Instance();
-    Architecture_t::SetRandomSeed(10);
-    TStopwatch timer;
-    const std::vector<TMVA::Event *> allData = loadEvents();
+    Architecture_t::SetRandomSeed(10);    
+    
+    const std::vector<TMVA::Event *> allData = loadEvents(0, nEvents, inFile);
       
     TString fileXML = "dataset/weights/mCBM_tmvaDL.weights.xml";
     DeepNet_t* fNet = ReadModelFromXML(fileXML, batchSize);
 
-
-    // Loading the training and validation datasets
+    // Loading the test dataset
     TMVA::DataSetInfo dsix;
     for(int i{0}; i < 72*32; i++){
         TString in1; in1.Form("in[%d]", i);
@@ -57,83 +62,105 @@ int predict_batch(size_t batchSize = 50){
         TString out2; out2.Form("tar_%d", i);
         dsix.AddTarget(out1, out2, "", (0.0), (0.0));
     }
-    TMVAInput_t trainingTuple = std::tie(allData, dsix); 
-    TensorDataLoader_t trainingData(trainingTuple, 1000, fNet->GetBatchSize(),
+    TMVAInput_t testTuple = std::tie(allData, dsix); 
+    TensorDataLoader_t testData(testTuple, allData.size(), fNet->GetBatchSize(),
                                     {fNet->GetInputDepth(), fNet->GetInputHeight(), fNet->GetInputWidth()},
                                     {fNet->GetBatchDepth(), fNet->GetBatchHeight(), fNet->GetBatchWidth()} ,
                                     fNet->GetOutputWidth(), 1);
-    timer.Start();
-    bool oneOut{};
-    for (auto batch : trainingData) {
-            auto inputTensor = batch.GetInput();
-            TMatrixT<Float_t> inMat(inputTensor.GetMatrix());
-            // (1) 2304 50
-            auto targetMatrix = batch.GetOutput();
-            TMatrixT<Float_t> tarMat(targetMatrix);
-            // 50 2304
-            fNet->Forward(inputTensor);
-            auto pred = fNet->GetLayers().back()->GetOutputAt(0);
-            TMatrixT<Float_t> predMat(pred);
-            // 50 2304
-            if(!oneOut){
-                std::cout << "inMat shape: " << inMat.GetNrows() << " " << inMat.GetNcols() << std::endl;
-                std::cout << "tarMat shape: " << tarMat.GetNrows() << " " << tarMat.GetNcols() << std::endl;
-                std::cout << "predMat shape: " << predMat.GetNrows() << " " << predMat.GetNcols() << std::endl;
-                
-                std::cout << "--------------  first batch  ----------------" << std::endl;
-                for(size_t i{}; i < 2304; i++){
-                    std::cout << "in: " << inMat(i, 0) << "  tar: " << tarMat(0, i) << 
-                                 "  pred: " << predMat(0, i) << std::endl;
-                }
-                std::cout << std::endl;
+    
+    TFile* outFile = new TFile("mrich_nn_eval.root", "RECREATE");
+    // Histograms
+    TH1F* allHitResponse = new TH1F("allHitResponse", "NN response for all hits", 50, 0., 1.);
+    allHitResponse->GetXaxis()->SetTitle("NN response"); allHitResponse->GetYaxis()->SetTitle("count");    
+    TH1F* trueHitResponse = new TH1F("trueHitResponse", "NN response for true hits", 50, 0., 1.);
+    trueHitResponse->GetXaxis()->SetTitle("NN response"); trueHitResponse->GetYaxis()->SetTitle("count");
+    TH1F* noiseHitResponse = new TH1F("noiseHitResponse", "NN response for noise hits", 50, 0., 1.);
+    noiseHitResponse->GetXaxis()->SetTitle("NN response"); noiseHitResponse->GetYaxis()->SetTitle("count");
 
-                std::cout << "--------------  second batch  ----------------" << std::endl;
-                for(size_t i{}; i < 2304; i++){
-                    std::cout << "in: " << inMat(i, 1) << "  tar: " << tarMat(1, i) << 
-                                 "  pred: " << predMat(1, i) << std::endl;
+    TH1F* trueHitResponseTH = new TH1F("trueHitResponseTH", "123", 10, -4., 5.);
+    TH1F* noiseHitResponseTH = new TH1F("noiseHitResponseTH", "1234", 10, -4., 5.);
+    // both hists together build the confusion matrix
+
+    std::vector<Bool_t> tarx;
+    std::vector<Float_t> predx;
+    std::vector<Bool_t> tarn;
+    std::vector<Float_t> predn;
+    std::vector<Float_t> weightsn;
+
+    TStopwatch timer;
+    timer.Start();
+    for (auto batch : testData) {
+        auto inputTensor = batch.GetInput();
+        TMatrixT<Float_t> inMat(inputTensor.GetMatrix()); // (1) 2304 50            
+        auto targetMatrix = batch.GetOutput();
+        TMatrixT<Float_t> tarMat(targetMatrix); // 50 2304            
+        
+        fNet->Forward(inputTensor);
+        
+        auto pred = fNet->GetLayers().back()->GetOutputAt(0);
+        TMatrixT<Float_t> predMat(pred); // 50 2304
+            
+        for(size_t i{}; i < fNet->GetBatchSize(); i++){
+            for(size_t j{}; j < 2304; j++){
+                if(inMat(j, i) > 0.9 && tarMat(i, j) > 0.9){ // true hit
+                    trueHitResponse->Fill(predMat(i, j));
+                    if(predMat(i, j) > NNthreshold){
+                        trueHitResponseTH->Fill(3.); // right after applying threshold
+                        tarx.push_back(1);
+                    }else{
+                        trueHitResponseTH->Fill(-2.); // wrong after applying threshold
+                        tarx.push_back(0);
+                    }
+                    predx.push_back(predMat(i, j));
                 }
-                std::cout << std::endl;
+                else if(inMat(j, i) > 0.9 && tarMat(i, j) < 0.1){ // noise hit
+                    noiseHitResponse->Fill(predMat(i, j));
+                    if(predMat(i, j) > NNthreshold){
+                        noiseHitResponseTH->Fill(-2.); // wrong after applying threshold
+                        tarn.push_back(0);
+                        weightsn.push_back(1.);
+                    }else{
+                        noiseHitResponseTH->Fill(3.); // right after applying threshold
+                        tarn.push_back(1);
+                        weightsn.push_back(1.);
+                    }
+                    predn.push_back(predMat(i, j));
+                }
+                if(inMat(j, i) > 0.9) allHitResponse->Fill(predMat(i, j));             
             }
-            oneOut = true;
-        }   
+        }
+    }   
     
     timer.Stop();
     Double_t dt1 = timer.RealTime();
-    std::cout << "timer lowlevel batch " << batchSize << "  total time: " << dt1<< std::endl;
-    
-    
-    
-    
-    
-    
-    
-    //TCudaMatrix<Float_t>* pred = new TCudaMatrix<Float_t>(batchSize, 72*32);
-    /* TCudaMatrix<Float_t>* pred = new TCudaMatrix<Float_t>(batchSize, 2304);
-    Tensor_t input = Architecture_t::CreateTensor(batchSize, fNet->GetInputDepth(), fNet->GetInputHeight(), fNet->GetInputWidth() ); //TODO: store on heap
-    TCudaHostBuffer<Float_t>* inputBuffer = 
-                    new TCudaHostBuffer<Float_t>( input.GetSize());
-    input.Zero();
-    pred->Zero();
-    for(int i{}; i < batchSize; i++){//t->GetEntriesFast() - 19200
-        t->GetEntry(19200 + i); //do single pred on some test event
-        for(int j{}; j < 2304; j++){
-            (*inputBuffer)[i*2304 +j] = in[j];
-        }
-    }
-    
-    input.GetDeviceBuffer().CopyFrom(*inputBuffer);
-    fNet->Prediction(*pred, input, TMVA::DNN::EOutputFunction::kIdentity);
-     */
-    
+    std::cout << "Time to eval "<<nEvents<<" events on gpu with batchsize " << batchSize << std::endl;
+    std::cout << "time: " << dt1 << "s" << std::endl;
+    TMVA::ROCCurve* rocx = new TMVA::ROCCurve(predx, tarx);
+    TMVA::ROCCurve* roc = new TMVA::ROCCurve(predn, tarn, weightsn);
+    TGraph* gRocx = rocx->GetROCCurve();
+    TGraph* gRoc = roc->GetROCCurve();
+    std::cout << "AUC true  : " << rocx->GetROCIntegral() << std::endl;
+    std::cout << "AUC noise : " << roc->GetROCIntegral() << std::endl;
+    outFile->cd();
+    gRocx->Write("RocTrueHits");
+    gRoc->Write("RocNoiseHits");
+    allHitResponse->Write();
+    trueHitResponse->Write();
+    noiseHitResponse->Write();
+    trueHitResponseTH->Write();
+    noiseHitResponseTH->Write();
+    //outFile->Write(); //write all hists at once
+    outFile->Close();
+
     return 1;
 }
 
-std::vector<TMVA::Event *> loadEvents(){ //target is denoisy input
+std::vector<TMVA::Event *> loadEvents(Long64_t firstEvt, Long64_t lastEvt,  const char* iFile){ 
 
     TStopwatch timer;
     timer.Start();
     std::cout << "loading Events from file ... \n" ; 
-    TFile *file = TFile::Open("../mcbm_sim.root"); 
+    TFile *file = TFile::Open(iFile); 
     TTree *tree = (TTree*)file->Get("train"); 
     Float_t in[2304];
     Float_t tar[2304];
@@ -142,7 +169,9 @@ std::vector<TMVA::Event *> loadEvents(){ //target is denoisy input
     std::vector<TMVA::Event*> allData;
         
     Long64_t nofEntries = tree->GetEntries();
-    for(Long64_t i=0; i < 1000; i++){
+    if(firstEvt > nofEntries) firstEvt = 0;
+    if(lastEvt > nofEntries || lastEvt == 0) lastEvt = nofEntries;
+    for(Long64_t i= firstEvt; i < lastEvt; i++){
         tree->GetEntry(i);
         std::vector<Float_t> input; 
         std::vector<Float_t> target; 
@@ -160,6 +189,7 @@ std::vector<TMVA::Event *> loadEvents(){ //target is denoisy input
     Double_t dt = timer.RealTime();
     std::cout << "loading finished ! \n" ; 
     std::cout << "time for loading Events  " << dt << "s\n";  
+    file->Close();
     return allData;
 }
 
